@@ -1,5 +1,4 @@
 # Configuration files (contains sensitive information)
-config.py
 
 # Python cache files
 __pycache__/
