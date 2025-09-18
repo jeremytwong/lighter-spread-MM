@@ -1,0 +1,652 @@
+import asyncio
+import websockets
+import json
+import time
+import logging
+import lighter
+from typing import Dict, Optional, Tuple
+
+logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.getLogger('websockets.client').setLevel(logging.ERROR)
+logging.getLogger('root').setLevel(logging.ERROR)
+logging.getLogger('urllib3.connectionpool').setLevel(logging.ERROR)
+logging.getLogger('asyncio').setLevel(logging.ERROR)
+logger = logging.getLogger(__name__)
+
+
+try:
+    from config import config
+except ImportError:
+    print("Error: config.py not found. Please copy config_example.py to config.py and configure your settings.")
+    exit(1)
+
+# Validate required configuration
+required_fields = ['account_index', 'api_key_private_key']
+for field in required_fields:
+    if field not in config or config[field] in [0, 'YOUR_PRIVATE_KEY_HERE', '']:
+        print(f"Error: {field} is not properly configured in config.py")
+        print("Please edit config.py and set your account details.")
+        exit(1)
+
+
+
+class SimpleLighterOrderBot:
+    def __init__(self, config: Dict):
+        self.config = config
+        self.base_url = config['base_url']
+        self.account_index = config['account_index']
+        self.api_key_private_key = config['api_key_private_key']
+        self.api_key_index = config['api_key_index']
+        self.market_index = config.get('market_index', 1)
+        self.order_size = config.get('order_size', 0.0002)
+        self.tick_size = config.get('tick_size', 0.1)
+        self.chase_interval = config.get('chase_interval', 0.5)
+        self.loss_threshold = config.get('loss_threshold', 0.005)
+        self.profit_threshold = config.get('profit_threshold', 0.002)
+        self.epsilon = 1e-6
+        self.reconnect_attempts = config.get('reconnect_attempts', 5)
+        self.reconnect_delay = config.get('reconnect_delay', 5.0)
+        self.tx_delay = config.get('tx_delay', 0.2)
+        self.order_timeout = config.get('order_timeout', 30.0)
+        self.position_check_interval = config.get('position_check_interval', 10.0)
+        
+        self.signer = lighter.SignerClient(
+            url=self.base_url,
+            private_key=self.api_key_private_key,
+            account_index=self.account_index,
+            api_key_index=self.api_key_index
+        )
+        
+        self.ws = None
+        self.order_book = {'bids': [], 'asks': []}
+        self.latest_highest_bid_price = None
+        self.latest_lowest_ask_price = None
+        self.active_buy_order = None
+        self.active_sell_order = None
+        self.active_bid_order = None
+        self.position = None
+        
+        self.last_logged_bid = None
+        self.last_logged_ask = None
+        self.last_action_time = 0
+        self.log_price_threshold = 0.5  
+
+    async def connect_websocket(self) -> bool:
+        """Connect to WebSocket and subscribe to order book and positions channels"""
+        hostname = self.base_url.replace('https://', '').replace('http://', '').split('/')[0]
+        ws_url = f"wss://{hostname}/stream"
+        logger.info(f"Connecting to WebSocket: {ws_url}")
+        
+        attempt = 0
+        while attempt < self.reconnect_attempts:
+            try:
+                self.ws = await websockets.connect(
+                    ws_url,
+                    ping_interval=60,
+                    ping_timeout=30,
+                    max_size=2**20
+                )
+                
+                order_book_subscribe = {
+                    "type": "subscribe",
+                    "channel": f"order_book/{self.market_index}"
+                }
+                await self.ws.send(json.dumps(order_book_subscribe))
+                await asyncio.sleep(0.1)
+
+                try:
+                    auth_token = self.signer.create_auth_token_with_expiry()
+                    if isinstance(auth_token, tuple):
+                        auth_token = auth_token[0]
+                except Exception as e:
+                    logger.error(f"Failed to generate auth token: {e}")
+                    auth_token = None
+
+                positions_subscribe = {
+                    "type": "subscribe",
+                    "channel": f"account_all_positions/{self.account_index}"
+                }
+                if auth_token:
+                    positions_subscribe["auth"] = auth_token
+                await self.ws.send(json.dumps(positions_subscribe))
+                await asyncio.sleep(0.1)
+                    
+                account_orders_subscribe = {
+                    "type": "subscribe",
+                    "channel": f"account_orders/{self.market_index}/{self.account_index}"
+                }
+                if auth_token:
+                    account_orders_subscribe["auth"] = auth_token
+                await self.ws.send(json.dumps(account_orders_subscribe))
+
+                try:
+                    for _ in range(3):
+                        message = await asyncio.wait_for(self.ws.recv(), timeout=5.0)
+                        data = json.loads(message)
+                        if data.get('type') == 'subscribed':
+                            channel = data.get('channel', '')
+                            if 'order_book' in channel:
+                                logger.info("Subscribed to order book channel")
+                            elif 'account_all_positions' in channel:
+                                logger.info("Subscribed to account positions channel")
+                            elif 'account_orders' in channel:
+                                logger.info("Subscribed to account orders channel")
+                        elif data.get('error'):
+                            logger.error(f"Subscription error: {data['error']}")
+                except asyncio.TimeoutError:
+                    logger.info("Subscription confirmation timeout, proceeding anyway")
+
+                return True
+            except Exception as e:
+                attempt += 1
+                logger.error(f"WebSocket connection failed (attempt {attempt}/{self.reconnect_attempts}): {e}")
+                if attempt < self.reconnect_attempts:
+                    await asyncio.sleep(self.reconnect_delay * (2 ** attempt))
+        return False
+
+    def update_order_book(self, order_book_update: Dict):
+        """Update order book with incremental data"""
+        try:
+            for side in ['bids', 'asks']:
+                if side in order_book_update:
+                    updates = order_book_update[side]
+                    current_side = self.order_book.get(side, [])
+                    book_dict = {}
+                    
+                    for entry in current_side:
+                        price = str(entry['price'])
+                        size = str(entry['size'])
+                        book_dict[price] = size
+                    
+                    for entry in updates:
+                        price = str(entry['price'])
+                        size = str(entry['size'])
+                        if float(size) == 0 or size == "0":
+                            book_dict.pop(price, None)
+                        else:
+                            book_dict[price] = size
+                    
+                    price_size_pairs = []
+                    for price_str, size_str in book_dict.items():
+                        price_float = float(price_str)
+                        size_float = float(size_str)
+                        price_size_pairs.append((price_float, size_float))
+                    
+                    is_bids = (side == 'bids')
+                    price_size_pairs.sort(key=lambda pair: pair[0], reverse=is_bids)
+                    sorted_orders = []
+                    for price, size in price_size_pairs:
+                        sorted_orders.append({
+                            'price': str(price),
+                            'size': str(size)
+                        })
+                    
+                    self.order_book[side] = sorted_orders
+        except Exception as e:
+            logger.error(f"Error updating order book: {e}")
+
+    def calculate_initial_price(self, ask_price: Optional[float], bid_price: Optional[float]) -> float:
+        """Calculate initial buy price based on available market data"""
+        if ask_price is not None:
+            return ask_price - self.tick_size
+        elif bid_price is not None:
+            return bid_price + self.tick_size
+        else:
+            raise ValueError("No market data available for price calculation")
+
+    def get_bid_ask_levels(self) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+        """Get the highest bid, second-highest bid, and lowest ask prices from the order book"""
+        top_bid, second_bid, lowest_ask = None, None, None
+        try:
+            if self.order_book.get('bids'):
+                bids = self.order_book['bids']
+                if len(bids) >= 1:
+                    top_bid = float(bids[0]['price'])
+                    if len(bids) >= 2:
+                        second_bid = float(bids[1]['price'])
+            if self.order_book.get('asks'):
+                asks = self.order_book['asks']
+                if asks:
+                    lowest_ask = float(min(asks, key=lambda x: float(x['price']))['price'])
+            return top_bid, second_bid, lowest_ask
+        except (IndexError, KeyError, ValueError) as e:
+            logger.error(f"Error getting bid/ask levels: {e}")
+            return None, None, None
+
+    async def check_position_via_api(self) -> bool:
+        """Check for open positions - now relies on WebSocket updates"""
+        if self.position:
+            print(f"CURRENT POSITION: entry={self.position['entry_price']:.1f}, size={self.position['size']:.6f}")
+            return True
+        else:
+            print("CURRENT POSITION: None")
+            return False
+
+    def handle_positions_update(self, data: Dict):
+        """Handle position updates from WebSocket"""
+        try:
+            positions = data.get('positions', {})
+            print("POSITIONS UPDATE:", positions)  
+            
+            market_position = positions.get(str(self.market_index))
+            
+            if market_position and float(market_position.get('position', 0)) != 0:
+                new_position = {
+                    'entry_price': float(market_position['avg_entry_price']),
+                    'size': float(market_position['position'])
+                }
+                
+                if not self.position:
+                    logger.info(f"NEW POSITION detected via WebSocket: entry_price={new_position['entry_price']:.1f}, size={new_position['size']:.6f}")
+                    self.position = new_position
+
+                    if self.active_buy_order:
+                        asyncio.create_task(self.cancel_order(is_sell=False))
+                else:
+                    self.position = new_position
+            else:
+                if self.position:
+                    logger.info("POSITION CLOSED detected via WebSocket")
+                    self.position = None
+                    if self.active_sell_order:
+                        asyncio.create_task(self.cancel_order(is_sell=True))
+                    if self.latest_highest_bid_price is not None:
+                        asyncio.create_task(self._place_initial_buy_after_delay())
+                        
+        except Exception as e:
+            logger.error(f"Error handling positions update: {e}")
+
+    async def _place_initial_buy_after_delay(self):
+        """Place initial buy order after a short delay"""
+        await asyncio.sleep(self.tx_delay)
+        if not self.position and not self.active_buy_order:
+            initial_price = self.calculate_initial_price(self.latest_lowest_ask_price, self.latest_highest_bid_price)
+            await self.place_limit_buy_order(initial_price)
+
+    async def place_limit_buy_order(self, price: float) -> bool:
+        """Place a limit buy order at the specified price"""
+        price_multiplier = 10
+        size_multiplier = 100000
+        price_int = int(price * price_multiplier)
+        size_int = int(self.order_size * size_multiplier)
+        client_order_index = int(time.time() * 1000)
+
+        logger.info(f"Bidding @ {price:.1f}")
+
+        try:
+            tx, tx_hash, err = await self.signer.create_order(
+                market_index=self.market_index,
+                client_order_index=client_order_index,
+                base_amount=size_int,
+                price=price_int,
+                is_ask=False,
+                order_type=lighter.SignerClient.ORDER_TYPE_LIMIT,
+                time_in_force=lighter.SignerClient.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
+                reduce_only=0,
+                trigger_price=0
+            )
+
+            if err is not None:
+                logger.error(f"Failed to place buy order: {err}")
+                return False
+
+            self.active_buy_order = {
+                'client_order_index': client_order_index,
+                'price': price,
+                'timestamp': time.time()
+            }
+            await asyncio.sleep(self.tx_delay)
+            return True
+        except Exception as e:
+            logger.error(f"Error placing buy order: {e}")
+            return False
+
+    async def place_limit_sell_order(self, price: float) -> bool:
+        """Place a limit sell order at the specified price"""
+        price_multiplier = 10
+        size_multiplier = 100000
+        price_int = int(price * price_multiplier)
+        size_int = int(self.order_size * size_multiplier)
+        client_order_index = int(time.time() * 1000)
+
+        logger.info(f"Selling @ {price:.1f}")
+
+        try:
+            tx, tx_hash, err = await self.signer.create_order(
+                market_index=self.market_index,
+                client_order_index=client_order_index,
+                base_amount=size_int,
+                price=price_int,
+                is_ask=True,
+                order_type=lighter.SignerClient.ORDER_TYPE_LIMIT,
+                time_in_force=lighter.SignerClient.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
+                reduce_only=1,
+                trigger_price=0
+            )
+
+            if err is not None:
+                logger.error(f"Failed to place sell order: {err}")
+                return False
+
+            self.active_sell_order = {
+                'client_order_index': client_order_index,
+                'price': price,
+                'timestamp': time.time()
+            }
+            await asyncio.sleep(self.tx_delay)
+            return True
+        except Exception as e:
+            logger.error(f"Error placing sell order: {e}")
+            return False
+
+    async def place_market_sell_order(self) -> bool:
+        """Place a market sell order"""
+        size_multiplier = 100000
+        size_int = int(self.order_size * size_multiplier)
+        client_order_index = int(time.time() * 1000)
+
+        logger.warning(f"Market selling (loss threshold reached)")
+
+        try:
+            tx, tx_hash, err = await self.signer.create_order(
+                market_index=self.market_index,
+                client_order_index=client_order_index,
+                base_amount=size_int,
+                price=0,
+                is_ask=True,
+                order_type=lighter.SignerClient.ORDER_TYPE_MARKET,
+                time_in_force=lighter.SignerClient.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
+                reduce_only=1,
+                trigger_price=0
+            )
+
+            if err is not None:
+                logger.error(f"Failed to place market sell order: {err}")
+                return False
+
+            await asyncio.sleep(self.tx_delay)
+            return True
+        except Exception as e:
+            logger.error(f"Error placing market sell order: {e}")
+            return False
+
+    async def cancel_order(self, is_sell: bool = False) -> bool:
+        """Cancel the active buy or sell order"""
+        order_type = 'sell' if is_sell else 'buy'
+        active_order = self.active_sell_order if is_sell else self.active_buy_order
+        if not active_order:
+            return True
+
+        try:
+            tx, tx_hash, err = await self.signer.cancel_order(
+                market_index=self.market_index,
+                order_index=active_order['client_order_index']
+            )
+            
+            if err is None:
+                if is_sell:
+                    self.active_sell_order = None
+                else:
+                    self.active_buy_order = None
+                await asyncio.sleep(self.tx_delay)
+                return True
+            else:
+                logger.error(f"{order_type.capitalize()} cancel failed: {err}")
+                return False
+        except Exception as e:
+            logger.error(f"Error cancelling {order_type} order: {e}")
+            return False
+
+    def handle_account_orders_update(self, data: Dict):
+        """Handle account orders updates from WebSocket - backup detection method"""
+        try:
+            market_orders = data.get('orders', {}).get(str(self.market_index), [])
+            if not market_orders:
+                return
+                
+            for order in market_orders:
+                client_order_index = order.get('client_order_index')
+                status = order.get('status')
+                
+                if client_order_index == (self.active_buy_order.get('client_order_index') if self.active_buy_order else None):
+                    if status == 'filled':
+                        logger.info(f"Buy order filled @ {self.active_buy_order['price']:.1f} (detected via orders)")
+                        self.position = {
+                            'entry_price': self.active_buy_order['price'],
+                            'size': self.order_size
+                        }
+                        self.active_buy_order = None
+                        
+                elif client_order_index == (self.active_sell_order.get('client_order_index') if self.active_sell_order else None):
+                    if status == 'filled':
+                        logger.info(f"Sell order filled @ {self.active_sell_order['price']:.1f} (detected via orders)")
+                        self.active_sell_order = None
+                        self.position = None
+                        if self.latest_highest_bid_price is not None:
+                            asyncio.create_task(self._place_initial_buy_after_delay())
+        except Exception as e:
+            logger.error(f"Error handling account orders update: {e}")
+
+    async def manage_position(self, top_bid: float, second_bid: float, lowest_ask: float):
+        """Manage position with 0.2% loss threshold, bid 0.02% above entry, and profit threshold."""
+        if not self.position:
+            return
+
+        entry_price = self.position['entry_price']
+        loss_threshold = 0.002
+        loss_price = entry_price * (1 - loss_threshold)
+        profit_price = entry_price * (1 + self.profit_threshold)
+
+        print(f"POSITION MANAGEMENT: entry={entry_price:.4f}, top_bid={top_bid:.4f}, "
+            f"loss_price={loss_price:.4f}, profit_price={profit_price:.4f}")
+
+        desired_bid_price = entry_price * 1.0002
+
+        if self.active_bid_order is None:
+            print(f"PLACING BID at {desired_bid_price:.4f} (0.02% above entry)")
+            success = await self.place_limit_buy_order(desired_bid_price)
+            if success:
+                self.active_bid_order = {
+                    'price': desired_bid_price,
+                    'timestamp': time.time()
+                }
+
+        if top_bid <= loss_price:
+            logger.warning(f"0.2% loss threshold reached: top_bid {top_bid:.4f} <= loss_price {loss_price:.4f}")
+            if self.active_sell_order:
+                await self.cancel_order(is_sell=True)
+            if await self.place_market_sell_order():
+                self.position = None
+                self.active_bid_order = None
+                if self.latest_highest_bid_price is not None:
+                    await self._place_initial_buy_after_delay()
+            return
+
+        if lowest_ask is not None and lowest_ask >= profit_price + self.epsilon:
+            desired_sell_price = profit_price - self.tick_size
+            print(f"DESIRED PROFIT SELL PRICE: {desired_sell_price:.4f}")
+
+            if self.active_sell_order:
+                our_sell_price = self.active_sell_order['price']
+                if desired_sell_price > our_sell_price + self.epsilon:
+                    if await self.cancel_order(is_sell=True):
+                        await asyncio.sleep(self.tx_delay)
+                        if abs(desired_sell_price - our_sell_price) > self.epsilon:
+                            await self.place_limit_sell_order(desired_sell_price)
+            else:
+                await self.place_limit_sell_order(desired_sell_price)
+
+        elif top_bid is not None and top_bid <= entry_price + self.epsilon:
+            if self.active_sell_order:
+                await self.cancel_order(is_sell=True)
+
+    async def should_chase_bid(self, top_bid: float, second_bid: float) -> Tuple[bool, float, str]:
+        """Determine if we should chase the bid"""
+        if not self.active_buy_order:
+            return False, 0, "No active buy order"
+            
+        our_price = self.active_buy_order['price']
+        
+        if top_bid > our_price + self.epsilon:
+            new_price = top_bid + self.tick_size
+            return True, new_price, f"Chase up to {new_price:.1f}"
+        
+        if abs(top_bid - our_price) < self.epsilon and second_bid is not None:
+            desired_price = second_bid + self.tick_size
+            if our_price > desired_price + self.tick_size:
+                return True, desired_price, f"Chase down to {desired_price:.1f}"
+        
+        return False, 0, "No chase needed"
+
+    async def process_order_book_update(self, top_bid: float, second_bid: float, lowest_ask: float):
+        """Process order book update - only log significant changes"""
+        self.latest_highest_bid_price = top_bid
+        self.latest_lowest_ask_price = lowest_ask
+        if (self.last_logged_bid is None or 
+            abs(top_bid - self.last_logged_bid) >= self.log_price_threshold or
+            time.time() - self.last_action_time > 30):
+            
+            ask_str = f"{lowest_ask:.1f}" if lowest_ask else "None"
+            pos_str = f"pos@{self.position['entry_price']:.1f}" if self.position else "no_pos"
+            buy_str = f"buy@{self.active_buy_order['price']:.1f}" if self.active_buy_order else "no_buy"
+            sell_str = f"sell@{self.active_sell_order['price']:.1f}" if self.active_sell_order else "no_sell"
+            
+            logger.info(f"Market: bid {top_bid:.1f}, ask {ask_str} | {pos_str} | {buy_str} | {sell_str}")
+            self.last_logged_bid = top_bid
+            self.last_logged_ask = lowest_ask
+
+        if self.position:
+            if self.active_buy_order:
+                logger.warning(f"CANCELING BUY ORDER - We have a position!")
+                await self.cancel_order(is_sell=False)
+            await self.manage_position(top_bid, second_bid, lowest_ask)
+            return
+        
+        if self.active_buy_order and time.time() - self.active_buy_order['timestamp'] > self.order_timeout:
+            await self.cancel_order(is_sell=False)
+            await self.check_position_via_api()
+            return
+        
+        if not self.active_buy_order and not self.position:
+            initial_price = self.calculate_initial_price(lowest_ask, top_bid)
+            logger.info(f"Placing initial buy order at {initial_price:.1f}")
+            await self.place_limit_buy_order(initial_price)
+            self.last_action_time = time.time()
+            return
+        
+        if not self.position:
+            should_chase, new_price, reason = await self.should_chase_bid(top_bid, second_bid)
+            
+            if should_chase:
+                logger.info(reason)
+                if await self.cancel_order(is_sell=False):
+                    await asyncio.sleep(self.tx_delay)
+                    await self.place_limit_buy_order(new_price)
+                    self.last_action_time = time.time()
+
+    async def chase_top_bid(self):
+        """Monitor order book and manage orders"""
+        last_position_check = 0
+        while True:
+            try:
+                message = await asyncio.wait_for(self.ws.recv(), timeout=self.chase_interval)
+                data = json.loads(message)
+                message_type = data.get('type')
+                
+                if message_type in ['update/order_book', 'subscribed/order_book']:
+                    order_book_data = data.get('order_book')
+                    if order_book_data:
+                        self.update_order_book(order_book_data)
+                        top_bid, second_bid, lowest_ask = self.get_bid_ask_levels()
+                        
+                        if top_bid is not None:
+                            await self.process_order_book_update(top_bid, second_bid, lowest_ask)
+                        
+                        if time.time() - last_position_check > self.position_check_interval:
+                            await self.check_position_via_api()
+                            last_position_check = time.time()
+
+                elif message_type == 'update/account_all_positions':
+                    self.handle_positions_update(data)
+                elif message_type == 'update/account_orders':
+                    self.handle_account_orders_update(data)
+                elif data.get('error'):
+                    logger.error(f"WebSocket error: {data['error']}")
+
+            except asyncio.TimeoutError:
+                continue
+            except websockets.exceptions.ConnectionClosed as e:
+                logger.error(f"WebSocket disconnected: {e}")
+                if await self.connect_websocket():
+                    logger.info("Reconnected successfully")
+                else:
+                    logger.error("Reconnection failed")
+                    break
+            except Exception as e:
+                logger.error(f"WebSocket error: {e}")
+                break
+
+    async def run(self):
+        """Run the bot"""
+        if not await self.connect_websocket():
+            logger.error("Failed to connect to WebSocket")
+            return
+
+        try:
+            logger.info("Checking for existing position...")
+            logger.info("Waiting for initial market data...")
+            while self.latest_highest_bid_price is None:
+                try:
+                    message = await asyncio.wait_for(self.ws.recv(), timeout=5.0)
+                    data = json.loads(message)
+                    if data.get('type') in ['update/order_book', 'subscribed/order_book']:
+                        order_book_data = data.get('order_book')
+                        if order_book_data:
+                            self.update_order_book(order_book_data)
+                            top_bid, _, lowest_ask = self.get_bid_ask_levels()
+                            if top_bid is not None:
+                                self.latest_highest_bid_price = top_bid
+                                self.latest_lowest_ask_price = lowest_ask
+                                lowest_ask_str = f"{lowest_ask:.1f}" if lowest_ask is not None else "None"
+                                position_str = f"pos@{self.position['entry_price']:.1f}" if self.position else "no_pos"
+                                logger.info(f"Initial market data: bid {top_bid:.1f}, ask {lowest_ask_str} | {position_str}")
+                                break
+                    elif data.get('type') == 'update/account_all_positions':
+                        self.handle_positions_update(data)
+                    elif data.get('error'):
+                        logger.error(f"WebSocket error: {data['error']}")
+                except asyncio.TimeoutError:
+                    continue
+                except Exception as e:
+                    logger.error(f"Error: {e}")
+                    break
+
+            if self.latest_highest_bid_price is not None and not self.position:
+                initial_price = self.calculate_initial_price(self.latest_lowest_ask_price, self.latest_highest_bid_price)
+                await self.place_limit_buy_order(initial_price)
+
+            logger.info("Starting trading bot...")
+            await self.chase_top_bid()
+
+        finally:
+            if self.active_buy_order:
+                await self.cancel_order(is_sell=False)
+            if self.active_sell_order:
+                await self.cancel_order(is_sell=True)
+            if self.ws:
+                await self.ws.close()
+                await self.signer.close()
+
+
+async def main():
+    logger.info("Initializing Trading Bot...")
+    bot = SimpleLighterOrderBot(config)
+    await bot.run()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
